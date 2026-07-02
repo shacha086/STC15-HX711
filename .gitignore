@@ -1,0 +1,20 @@
+# Keil C51 build outputs
+Objects/
+Listings/
+*.obj
+*.__i
+*.lst
+*.map
+*.m51
+*.SBR
+*.lnp
+*.build_log.htm
+
+# Keil user settings
+STC15Proj.uvgui.*
+STC15Proj.uvopt
+
+# Editor temp files
+*.bak
+*.tmp
+*~
