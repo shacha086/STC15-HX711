@@ -10,19 +10,17 @@
 
 #define VREF 5000UL
 
-#define IAP_ADDRESS 0x0400
+#define IAP_ZERO_ADDR   0x0400
+#define IAP_SPAN_ADDR   0x0404
 #define CMD_IDLE    0
 #define CMD_READ    1
 #define CMD_PROGRAM 2
 #define CMD_ERASE   3
 #define ENABLE_IAP  0x82
 
-unsigned char code sineTable[64] = {
-128,140,152,164,176,187,198,208,217,226,233,240,245,249,252,254,
-255,254,252,249,245,240,233,226,217,208,198,187,176,164,152,140,
-128,115,103, 91, 79, 68, 57, 47, 38, 29, 22, 15, 10,  6,  3,  1,
-  1,  1,  3,  6, 10, 15, 22, 29, 38, 47, 57, 68, 79, 91,103,115
-};
+#define LONG_PRESS_THRESH 20
+
+volatile bit button_pressed = 0;
 
 void Delay1us(void)	//@11.0592MHz
 {
@@ -52,25 +50,23 @@ void GPIO_Init() {
 	P3M0 = (P3M0 & ~0x10) | 0xE0; P3M1 &= ~0xF0;
 	// P10-P17: Push-Pull
 	P1M0 = 0xFF; P1M1 = 0x00;
-	// P32: Pull-up
+	// P32: Quasi-bidirectional, pull-up for button
 	BUTTON = 1;
-	// P32: falling-edge interrupting
-	IT0 = 1;			//INT0(P3.2)下降沿中断
-	EX0 = 1;			//使能INT0中断
+	IT0 = 1;
+	EX0 = 1;
 	EA  = 1;
-	// P33: Push-Pull (test use)
+	// P33: Push-Pull (debug)
 	P3M0 |= 0x08; P3M1 &= ~0x08;
-	
 }
 
 void UART_Init(void)
 {
-	SCON = 0x50;			// 8-bit UART, variable baud rate, enable receive
-	AUXR |= 0x01;			// serial 1 use timer 2 as baud rate generator
-	AUXR |= 0x04;			// timer 2 1T mode
-	T2L = 0xE0;				// baud rate 9600 @ 11.0592MHz
+	SCON = 0x50;
+	AUXR |= 0x01;
+	AUXR |= 0x04;
+	T2L = 0xE0;
 	T2H = 0xFE;
-	AUXR |= 0x10;			// start timer 2
+	AUXR |= 0x10;
 }
 
 void UART_SendByte(unsigned char byte)
@@ -96,27 +92,6 @@ void UART_SendUlong(unsigned long n)
 		buf[--i] = '0' + (unsigned char)(n % 10);
 		n /= 10;
 	} while (n);
-	UART_SendStr(&buf[i]);
-}
-
-void UART_SendLong(long n)
-{
-	unsigned char buf[12];
-	unsigned char i = 11;
-	buf[11] = '\0';
-	if (n < 0) {
-		n = -n;
-		do {
-			buf[--i] = '0' + (unsigned char)(n % 10);
-			n /= 10;
-		} while (n);
-		buf[--i] = '-';
-	} else {
-		do {
-			buf[--i] = '0' + (unsigned char)(n % 10);
-			n /= 10;
-		} while (n);
-	}
 	UART_SendStr(&buf[i]);
 }
 
@@ -146,24 +121,24 @@ void AD7524_WriteDat(unsigned char dat) {
 }
 
 unsigned long HX711_Read(void) {
-	unsigned long count; 
-	unsigned char i; 
+	unsigned long count;
+	unsigned char i;
 	HX711_DOUT = 1;
 	Delay1us();
-	HX711_SCK = 0; 
-	count = 0; 
-	while (HX711_DOUT); 
-	for (i = 0; i < 24; i++) { 
-		HX711_SCK = 1; 
-		count <<= 1; 
-		HX711_SCK = 0; 
-		if (HX711_DOUT) count++; 
+	HX711_SCK = 0;
+	count = 0;
+	while (HX711_DOUT);
+	for (i = 0; i < 24; i++) {
+		HX711_SCK = 1;
+		count <<= 1;
+		HX711_SCK = 0;
+		if (HX711_DOUT) count++;
 	}
 	HX711_SCK = 1;
 	count ^= 0x800000;
 	Delay1us();
 	HX711_SCK = 0;
-	return count;	
+	return count;
 }
 
 void IapIdle()
@@ -243,60 +218,96 @@ unsigned char EEPROM_IsValid(unsigned int addr)
 	return 0;
 }
 
-volatile char button_pressed = 0;
-
 void main(void) {
 	unsigned long hx711_val;
 	unsigned long zero_offset = 0;
-	long diff;
-	unsigned char sineIdx = 0;
+	unsigned long span = 0;
+	unsigned int press_cnt;
+	long weight_raw;
 	unsigned char dac_val;
 	unsigned int dac_mv;
-	unsigned char uart_cmd;
 
 	GPIO_Init();
 	UART_Init();
 	AD7524_Init();
 
-	// Load zero offset from EEPROM
-	if (EEPROM_IsValid(IAP_ADDRESS)) {
-		zero_offset = EEPROM_ReadLong(IAP_ADDRESS);
+	// Load calibration from EEPROM
+	if (EEPROM_IsValid(IAP_ZERO_ADDR)) {
+		zero_offset = EEPROM_ReadLong(IAP_ZERO_ADDR);
+	}
+	if (EEPROM_IsValid(IAP_SPAN_ADDR)) {
+		span = EEPROM_ReadLong(IAP_SPAN_ADDR);
 	}
 
 	UART_SendStr("Init complete\r\n");
-	UART_SendStr("Zero: ");
-	UART_SendUlong(zero_offset);
+	UART_SendStr("Zero: "); UART_SendUlong(zero_offset);
+	UART_SendStr(" Span: "); UART_SendUlong(span);
 	UART_SendStr("\r\n");
 
 	while (1) {
 		hx711_val = HX711_Read();
 
-		// UART command
-		if (RI) {
-			uart_cmd = SBUF;
-			RI = 0;
-			if (uart_cmd == 'Z' || uart_cmd == 'z') {
-				zero_offset = hx711_val;
-				IapEraseSector(IAP_ADDRESS);
-				EEPROM_WriteLong(IAP_ADDRESS, zero_offset);
-				UART_SendStr(">>> TARE: zero=");
-				UART_SendUlong(zero_offset);
-				UART_SendStr("\r\n");
+		// Button: short press = tare, long press = span
+		if (button_pressed) {
+			button_pressed = 0;
+			EX0 = 0;
+			Delay50ms();                    // Press debounce
+			if (BUTTON == 0) {              // Valid press
+				press_cnt = 0;
+				while (BUTTON == 0) {       // Measure hold duration
+					Delay50ms();
+					press_cnt++;
+				}
+				Delay50ms();                // Release debounce
+
+				if (press_cnt < LONG_PRESS_THRESH) {
+					// Short press: tare (0g calibration)
+					zero_offset = hx711_val;
+					IapEraseSector(IAP_ZERO_ADDR);
+					EEPROM_WriteLong(IAP_ZERO_ADDR, zero_offset);
+					if (span > 0) {
+						EEPROM_WriteLong(IAP_SPAN_ADDR, span);
+					}
+					UART_SendStr(">>> TARE: zero=");
+					UART_SendUlong(zero_offset);
+					UART_SendStr("\r\n");
+				} else {
+					// Long press: span calibration (100g -> 5V)
+					if (hx711_val > zero_offset) {
+						span = hx711_val - zero_offset;
+						IapEraseSector(IAP_ZERO_ADDR);
+						EEPROM_WriteLong(IAP_ZERO_ADDR, zero_offset);
+						EEPROM_WriteLong(IAP_SPAN_ADDR, span);
+						UART_SendStr(">>> SPAN: hx711=");
+						UART_SendUlong(hx711_val);
+						UART_SendStr(" span=");
+						UART_SendUlong(span);
+						UART_SendStr("\r\n");
+					} else {
+						UART_SendStr(">>> SPAN ERR: reading <= zero, tare first\r\n");
+					}
+				}
 			}
+			EX0 = 1;
 		}
 
-		// DAC sine wave
-		dac_val = sineTable[sineIdx];
-		sineIdx = (sineIdx + 1) & 0x3F;
+		// Weight to DAC (0g -> 0V, 100g -> 5V)
+		if (span > 0 && hx711_val > zero_offset) {
+			weight_raw = (long)(hx711_val - zero_offset);
+			dac_val = (unsigned char)(((unsigned long)weight_raw * 255) / span);
+			if (dac_val > 255) dac_val = 255;
+		} else {
+			dac_val = 0;
+		}
 		AD7524_WriteDat(dac_val);
 		dac_mv = (unsigned int)((unsigned long)dac_val * VREF / 256);
 
-		// Button
-		if (button_pressed) {
-			button_pressed = 0;
-			UART_SendStr("Button pressed!");
-		}
-		
+		// Debug output
+		UART_SendStr("HX711:"); UART_SendUlong(hx711_val);
+		UART_SendStr(" dacVal:"); UART_SendUint(dac_val);
+		UART_SendStr(" DAC:"); UART_SendUint(dac_mv);
+		UART_SendStr("mV\r\n");
+
 		DEBUG_PIN = ~DEBUG_PIN;
 		Delay50ms();
 	}
