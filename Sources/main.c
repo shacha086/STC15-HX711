@@ -12,6 +12,9 @@
 
 #define IAP_ZERO_ADDR   0x0400
 #define IAP_SPAN_ADDR   0x0404
+#define IAP_DACCAL_ADDR 0x0408
+#define DAC_CAL_DEN     256
+#define DAC_CAL_NOM     256
 #define CMD_IDLE    0
 #define CMD_READ    1
 #define CMD_PROGRAM 2
@@ -225,7 +228,9 @@ void main(void) {
 	unsigned int press_cnt;
 	long weight_raw;
 	unsigned char dac_val;
+	unsigned char dac_write;
 	unsigned int dac_mv;
+	unsigned int dac_cal = DAC_CAL_NOM;
 
 	GPIO_Init();
 	UART_Init();
@@ -238,14 +243,19 @@ void main(void) {
 	if (EEPROM_IsValid(IAP_SPAN_ADDR)) {
 		span = EEPROM_ReadLong(IAP_SPAN_ADDR);
 	}
+	dac_cal = ((unsigned int)IapReadByte(IAP_DACCAL_ADDR) << 8)
+	        |  (unsigned int)IapReadByte(IAP_DACCAL_ADDR + 1);
+	if (dac_cal == 0 || dac_cal == 0xFFFF) dac_cal = DAC_CAL_NOM;
 
 	UART_SendStr("Init complete\r\n");
 	UART_SendStr("Zero: "); UART_SendUlong(zero_offset);
 	UART_SendStr(" Span: "); UART_SendUlong(span);
+	UART_SendStr(" Cal: "); UART_SendUint(dac_cal);
 	UART_SendStr("\r\n");
 
 	while (1) {
 		hx711_val = HX711_Read();
+		hx711_val &= ~7UL;              // Discard lower 3 bits for stability
 
 		// Button: short press = tare, long press = span
 		if (button_pressed) {
@@ -268,6 +278,8 @@ void main(void) {
 					if (span > 0) {
 						EEPROM_WriteLong(IAP_SPAN_ADDR, span);
 					}
+					IapProgramByte(IAP_DACCAL_ADDR,     (unsigned char)(dac_cal >> 8));
+					IapProgramByte(IAP_DACCAL_ADDR + 1, (unsigned char)(dac_cal));
 					UART_SendStr(">>> TARE: zero=");
 					UART_SendUlong(zero_offset);
 					UART_SendStr("\r\n");
@@ -278,6 +290,8 @@ void main(void) {
 						IapEraseSector(IAP_ZERO_ADDR);
 						EEPROM_WriteLong(IAP_ZERO_ADDR, zero_offset);
 						EEPROM_WriteLong(IAP_SPAN_ADDR, span);
+						IapProgramByte(IAP_DACCAL_ADDR,     (unsigned char)(dac_cal >> 8));
+						IapProgramByte(IAP_DACCAL_ADDR + 1, (unsigned char)(dac_cal));
 						UART_SendStr(">>> SPAN: hx711=");
 						UART_SendUlong(hx711_val);
 						UART_SendStr(" span=");
@@ -299,12 +313,16 @@ void main(void) {
 		} else {
 			dac_val = 0;
 		}
-		AD7524_WriteDat(dac_val);
+		// Apply DAC gain calibration: dac_cal = 256 / G_actual * 256
+		dac_write = (unsigned char)(((unsigned long)dac_val * dac_cal) / DAC_CAL_DEN);
+		if (dac_write > 255) dac_write = 255;
+		AD7524_WriteDat(dac_write);
 		dac_mv = (unsigned int)((unsigned long)dac_val * VREF / 256);
 
 		// Debug output
 		UART_SendStr("HX711:"); UART_SendUlong(hx711_val);
-		UART_SendStr(" dacVal:"); UART_SendUint(dac_val);
+		UART_SendStr(" val:"); UART_SendUint(dac_val);
+		UART_SendStr(" wr:"); UART_SendUint(dac_write);
 		UART_SendStr(" DAC:"); UART_SendUint(dac_mv);
 		UART_SendStr("mV\r\n");
 
