@@ -9,6 +9,7 @@
 #define AD7524_DAT P1
 
 #define VREF 5000UL
+#define AMP_GAIN 2
 
 #define IAP_ZERO_ADDR   0x0400
 #define IAP_SPAN_ADDR   0x0404
@@ -144,6 +145,15 @@ unsigned long HX711_Read(void) {
 	return count;
 }
 
+unsigned long HX711_ReadAvg(void) {
+	unsigned char j;
+	unsigned long sum = 0;
+	for (j = 0; j < 5; j++) {
+		sum += HX711_Read();
+	}
+	return (sum / 5) & ~7UL;
+}
+
 void IapIdle()
 {
 	IAP_CONTR = 0;
@@ -160,9 +170,11 @@ unsigned char IapReadByte(unsigned int addr)
 	IAP_CMD = CMD_READ;
 	IAP_ADDRL = addr;
 	IAP_ADDRH = addr >> 8;
+	EA = 0;
 	IAP_TRIG = 0x5A;
 	IAP_TRIG = 0xA5;
 	_nop_();
+	EA = 1;
 	dat = IAP_DATA;
 	IapIdle();
 	return dat;
@@ -175,9 +187,11 @@ void IapProgramByte(unsigned int addr, unsigned char dat)
 	IAP_ADDRL = addr;
 	IAP_ADDRH = addr >> 8;
 	IAP_DATA = dat;
+	EA = 0;
 	IAP_TRIG = 0x5A;
 	IAP_TRIG = 0xA5;
 	_nop_();
+	EA = 1;
 	IapIdle();
 }
 
@@ -187,9 +201,11 @@ void IapEraseSector(unsigned int addr)
 	IAP_CMD = CMD_ERASE;
 	IAP_ADDRL = addr;
 	IAP_ADDRH = addr >> 8;
+	EA = 0;
 	IAP_TRIG = 0x5A;
 	IAP_TRIG = 0xA5;
 	_nop_();
+	EA = 1;
 	IapIdle();
 }
 
@@ -221,6 +237,25 @@ unsigned char EEPROM_IsValid(unsigned int addr)
 	return 0;
 }
 
+unsigned char code lut_raw[]  = {0, 9, 37, 64, 92, 118, 146, 173, 201, 228, 255};
+unsigned char code lut_corr[] = {0, 26, 51, 76, 102, 128, 153, 179, 204, 230, 255};
+#define LUT_NUM 11
+
+unsigned char dac_linearize(unsigned char raw)
+{
+	unsigned char i;
+	unsigned int dx, dy, offset;
+	for (i = 0; i < LUT_NUM - 1; i++) {
+		if (raw <= lut_raw[i + 1]) {
+			dx = lut_raw[i + 1] - lut_raw[i];
+			dy = lut_corr[i + 1] - lut_corr[i];
+			offset = ((unsigned int)(raw - lut_raw[i]) * dy) / dx;
+			return lut_corr[i] + (unsigned char)offset;
+		}
+	}
+	return raw;
+}
+
 void main(void) {
 	unsigned long hx711_val;
 	unsigned long zero_offset = 0;
@@ -231,6 +266,7 @@ void main(void) {
 	unsigned char dac_write;
 	unsigned int dac_mv;
 	unsigned int dac_cal = DAC_CAL_NOM;
+	unsigned long dac_tmp;
 
 	GPIO_Init();
 	UART_Init();
@@ -254,8 +290,7 @@ void main(void) {
 	UART_SendStr("\r\n");
 
 	while (1) {
-		hx711_val = HX711_Read();
-		hx711_val &= ~7UL;              // Discard lower 3 bits for stability
+		hx711_val = HX711_ReadAvg();
 
 		// Button: short press = tare, long press = span
 		if (button_pressed) {
@@ -305,11 +340,11 @@ void main(void) {
 			EX0 = 1;
 		}
 
-		// Weight to DAC (0g -> 0V, 100g -> 5V)
+		// Weight to DAC (0g -> 0V, 100g -> 10V)
 		if (span > 0 && hx711_val > zero_offset) {
 			weight_raw = (long)(hx711_val - zero_offset);
-			dac_val = (unsigned char)(((unsigned long)weight_raw * 255) / span);
-			if (dac_val > 255) dac_val = 255;
+			dac_tmp = ((unsigned long)weight_raw * 255) / span;
+			dac_val = (dac_tmp > 255) ? 255 : dac_linearize((unsigned char)dac_tmp);
 		} else {
 			dac_val = 0;
 		}
@@ -317,7 +352,7 @@ void main(void) {
 		dac_write = (unsigned char)(((unsigned long)dac_val * dac_cal) / DAC_CAL_DEN);
 		if (dac_write > 255) dac_write = 255;
 		AD7524_WriteDat(dac_write);
-		dac_mv = (unsigned int)((unsigned long)dac_val * VREF / 256);
+		dac_mv = (unsigned int)((unsigned long)dac_val * VREF * AMP_GAIN / 256);
 
 		// Debug output
 		UART_SendStr("HX711:"); UART_SendUlong(hx711_val);
